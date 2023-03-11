@@ -35,6 +35,7 @@
 
 namespace tdcore {
 using td::make_unique;
+using td::NetQueryCallback;
 
 class TdCoreSessionCallback final : public td::Session::Callback {
  public:
@@ -72,9 +73,9 @@ class TdCoreSessionCallback final : public td::Session::Callback {
   td::ActorShared<> parent_;
 };
 
-class TdCallbackImpl : public td::TdCallback {
+class TdCallbackStub : public td::TdCallback {
  public:
-  explicit TdCallbackImpl() {
+  explicit TdCallbackStub() {
   }
 
   void on_error(std::uint64_t id, td::td_api::object_ptr<td::td_api::error> error) override {
@@ -84,7 +85,22 @@ class TdCallbackImpl : public td::TdCallback {
   }
 };
 
-class TdCoreApplication final : public td::NetQueryCallback {
+class TdCoreNetQueryCallback final : public NetQueryCallback {
+ public:
+  explicit TdCoreNetQueryCallback(td::ActorShared<> parent, td::Promise<td::NetQueryPtr> promise)
+      : parent_(std::move(parent)), promise_(std::move(promise)) {
+  }
+
+  void on_result(td::NetQueryPtr query) final {
+    promise_.set_result(std::move(query));
+  }
+
+ private:
+  td::Promise<td::NetQueryPtr> promise_;
+  td::ActorShared<> parent_;
+};
+
+class TdCoreApplication final : public td::Actor {
  private:
   td::TdParameters parameters_;
   td::DcId dc_id_;
@@ -96,8 +112,6 @@ class TdCoreApplication final : public td::NetQueryCallback {
 
   td::unique_ptr<td::OptionManager> option_manager_;
 
-  td::FlatHashMap<td::uint64, td::Promise<td::NetQueryPtr>> response_promise_;
-
  public:
   TdCoreApplication(td::TdParameters parameters, td::DcId dc_id) : parameters_(parameters), dc_id_(dc_id) {
   }
@@ -105,7 +119,7 @@ class TdCoreApplication final : public td::NetQueryCallback {
   void start_up() final {
     auto old_context = set_context(std::make_shared<td::Global>());
 
-    td_ = td::create_actor<td::Td>("Td", std::move(td::make_unique<TdCallbackImpl>()), td::Td::Td::Options{});
+    td_ = td::create_actor<td::Td>("Td", std::move(td::make_unique<TdCallbackStub>()), td::Td::Td::Options{});
     state_manager_ = td::create_actor<td::StateManager>("StateManager", actor_shared(this));
     connection_creator_ = td::create_actor<td::ConnectionCreator>("ConnectionCreator", actor_shared(this));
 
@@ -167,28 +181,14 @@ class TdCoreApplication final : public td::NetQueryCallback {
     td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::Other);
   }
 
-  void perform_network_query(const td::telegram_api::Function &function, td::Promise<td::NetQueryPtr> result) {
-    const auto query_id = td::UniqueId::next();
-
-    response_promise_[query_id] = std::move(result);
-
-    auto query = td::G()->net_query_creator().create(query_id, function, {}, td::DcId::main(),
+  void perform_network_query(const td::telegram_api::Function &function, td::Promise<td::NetQueryPtr> promise) {
+    auto query = td::G()->net_query_creator().create(td::UniqueId::next(), function, {}, td::DcId::main(),
                                                      td::NetQuery::Type::Common, td::NetQuery::AuthFlag::On);
 
-    query->set_callback(actor_shared(this));
+    query->set_callback(
+        td::create_actor<TdCoreNetQueryCallback>("NetworkQueryCallback", actor_shared(this), std::move(promise)));
 
     td::send_closure(session_, &td::Session::send, std::move(query));
-  }
-
-  void on_result(td::NetQueryPtr query) final {
-    auto response_promise = std::move(response_promise_.find(query->id()));
-
-    if (response_promise->empty()) {
-      return;
-    }
-
-    response_promise->second.set_result(std::move(query));
-    response_promise_.erase(response_promise->first);
   }
 
   void hangup() final {
@@ -197,14 +197,6 @@ class TdCoreApplication final : public td::NetQueryCallback {
     connection_creator_.reset();
     option_manager_.reset();
     td_.reset();
-
-    for (auto &response : response_promise_) {
-      auto response_error = td::NetQueryPtr();
-      response_error->set_error(td::Status::Error(500, "Hangup"));
-      response.second.set_result(std::move(response_error));
-    }
-
-    response_promise_.clear();
   };
 };
 }  // namespace tdcore
