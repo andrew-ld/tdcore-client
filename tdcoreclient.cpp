@@ -15,6 +15,7 @@
 #include "td/telegram/net/NetQuery.h"
 #include "td/telegram/net/NetQueryDispatcher.h"
 #include "td/telegram/net/NetQueryStats.h"
+#include "td/telegram/net/NetStatsManager.h"
 #include "td/telegram/net/PublicRsaKeyShared.h"
 #include "td/telegram/OptionManager.h"
 #include "td/telegram/StateManager.h"
@@ -108,6 +109,7 @@ class TdCoreApplication final : public td::Actor {
   td::ActorOwn<td::Td> td_;
   td::ActorOwn<td::StateManager> state_manager_;
   td::ActorOwn<td::ConnectionCreator> connection_creator_;
+  td::ActorOwn<td::NetStatsManager> net_stats_manager_;
 
   td::unique_ptr<td::OptionManager> option_manager_;
 
@@ -119,11 +121,20 @@ class TdCoreApplication final : public td::Actor {
     auto old_context = set_context(std::make_shared<td::Global>());
 
     td_ = td::create_actor<td::Td>("Td", std::move(td::make_unique<TdCallbackStub>()), td::Td::Td::Options{});
+
     state_manager_ = td::create_actor<td::StateManager>("StateManager", actor_shared(this));
     connection_creator_ = td::create_actor<td::ConnectionCreator>("ConnectionCreator", actor_shared(this));
+    net_stats_manager_ = td::create_actor<td::NetStatsManager>("NetStatsManager", actor_shared(this));
+
+    auto net_stats_manager_ptr = net_stats_manager_.get_actor_unsafe();
+    net_stats_manager_ptr->init();
+
+    connection_creator_.get_actor_unsafe()->set_net_stats_callback(net_stats_manager_ptr->get_common_stats_callback(),
+                                                                   net_stats_manager_ptr->get_media_stats_callback());
 
     td::G()->set_state_manager(state_manager_.get());
     td::G()->set_connection_creator(std::move(connection_creator_));
+    td::G()->set_net_stats_file_callbacks(net_stats_manager_ptr->get_file_stats_callbacks());
 
     auto database_promise = td::PromiseCreator::lambda(
         [actor_id = actor_id(this), this](td::Result<td::TdDb::OpenedDatabase> r_opened_database) {
@@ -189,14 +200,6 @@ class TdCoreApplication final : public td::Actor {
 
     td::send_closure(session_, &td::Session::send, std::move(query));
   }
-
-  void hangup() final {
-    session_.reset();
-    state_manager_.reset();
-    connection_creator_.reset();
-    option_manager_.reset();
-    td_.reset();
-  };
 };
 }  // namespace tdcore
 
