@@ -84,7 +84,7 @@ class TdCallbackImpl : public td::TdCallback {
   }
 };
 
-class CoreTdApplication final : public td::NetQueryCallback {
+class TdCoreApplication final : public td::NetQueryCallback {
  private:
   td::TdParameters parameters_;
   td::DcId dc_id_;
@@ -99,7 +99,7 @@ class CoreTdApplication final : public td::NetQueryCallback {
   td::FlatHashMap<td::uint64, td::Promise<td::NetQueryPtr>> response_promise_;
 
  public:
-  CoreTdApplication(td::TdParameters parameters, td::DcId dc_id) : parameters_(parameters), dc_id_(dc_id) {
+  TdCoreApplication(td::TdParameters parameters, td::DcId dc_id) : parameters_(parameters), dc_id_(dc_id) {
   }
 
   void start_up() final {
@@ -225,13 +225,13 @@ int main(int argc, char *argv[]) {
 
   {
     auto guard = sched.get_main_guard();
-    auto with_context = td::create_actor<tdcore::CoreTdApplication>("Application", parameters, dc).release();
+    auto with_context = td::create_actor<tdcore::TdCoreApplication>("Application", parameters, dc).release();
 
     auto query = td::telegram_api::help_getConfig();
 
     auto query_promise = td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result " << result; });
 
-    td::send_closure(with_context, &tdcore::CoreTdApplication::perform_network_query,
+    td::send_closure(with_context, &tdcore::TdCoreApplication::perform_network_query,
                      td::telegram_api::help_getConfig(), std::move(query_promise));
   }
 
