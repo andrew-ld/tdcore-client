@@ -22,6 +22,7 @@
 #include "td/telegram/TdCallback.h"
 #include "td/telegram/TdParameters.h"
 #include "td/telegram/telegram_api.h"
+#include "td/utils/buffer.h"
 #include "td/utils/FlatHashMap.h"
 #include "td/utils/logging.h"
 #include "td/utils/Promise.h"
@@ -173,28 +174,29 @@ class CoreTdApplication final : public td::NetQueryCallback {
   }
 
   void on_result(td::NetQueryPtr query) final {
-    auto response_promise = std::move(response_promise_[query->id()]);
-    response_promise_.erase(query->id());
-    response_promise.set_result(std::move(query));
-  }
+    auto response_promise = std::move(response_promise_.find(query->id()));
 
-  void hangup_shared() final {
-    stop();
+    if (response_promise->empty()) {
+      return;
+    }
+
+    response_promise->second.set_result(std::move(query));
+    response_promise_.erase(response_promise->first);
   }
 
   void hangup() final {
     session_.reset();
-    td_.reset();
-    state_manager_.reset();
-    connection_creator_.reset();
-  }
 
-  void timeout_expired() final {
-    session_.reset();
-    td_.reset();
+    for (auto &response : response_promise_) {
+      auto response_error = td::NetQueryPtr();
+      response_error->set_error(td::Status::Error(500, "Hangup"));
+      response.second.set_result(std::move(response_error));
+    }
+
     state_manager_.reset();
     connection_creator_.reset();
-  }
+    td_.reset();
+  };
 };
 }  // namespace tdcore
 
@@ -218,8 +220,7 @@ int main(int argc, char *argv[]) {
 
     auto query = td::telegram_api::help_getConfig();
 
-    auto query_promise =
-        td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result " << result->tl_constructor(); });
+    auto query_promise = td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result " << result; });
 
     td::send_closure(with_context, &tdcore::CoreTdApplication::perform_network_query,
                      td::telegram_api::help_getConfig(), std::move(query_promise));
