@@ -225,14 +225,13 @@ int main(int argc, char *argv[]) {
 
   {
     auto guard = sched.get_main_guard();
-    auto with_context = td::create_actor<tdcore::TdCoreApplication>("Application", parameters, dc).release();
+
+    auto app = td::create_actor<tdcore::TdCoreApplication>("Application", parameters, dc).release();
 
     auto query = td::telegram_api::help_getConfig();
+    auto promise = td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result " << result; });
 
-    auto query_promise = td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result " << result; });
-
-    td::send_closure(with_context, &tdcore::TdCoreApplication::perform_network_query,
-                     td::telegram_api::help_getConfig(), std::move(query_promise));
+    td::send_closure(app, &tdcore::TdCoreApplication::perform_network_query, std::move(query), std::move(promise));
   }
 
   sched.start();
