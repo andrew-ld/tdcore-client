@@ -26,6 +26,7 @@
 #include "td/utils/FlatHashMap.h"
 #include "td/utils/logging.h"
 #include "td/utils/Promise.h"
+#include "td/utils/ScopeGuard.h"
 #include "td/utils/unique_ptr.h"
 #include <algorithm>
 #include <memory>
@@ -33,6 +34,8 @@
 #include <utility>
 
 namespace tdcore {
+using td::make_unique;
+
 class TdCoreSessionCallback final : public td::Session::Callback {
  public:
   TdCoreSessionCallback(td::ActorShared<> parent, td::DcOption option) : parent_(std::move(parent)), option_(option) {
@@ -91,6 +94,8 @@ class CoreTdApplication final : public td::NetQueryCallback {
   td::ActorOwn<td::StateManager> state_manager_;
   td::ActorOwn<td::ConnectionCreator> connection_creator_;
 
+  td::unique_ptr<td::OptionManager> option_manager_;
+
   td::FlatHashMap<td::uint64, td::Promise<td::NetQueryPtr>> response_promise_;
 
  public:
@@ -114,13 +119,15 @@ class CoreTdApplication final : public td::NetQueryCallback {
           }
 
           td::G()->init(parameters_, std::move(td_.get()), r_opened_database.move_as_ok().database).ensure();
+
+          option_manager_ = make_unique<td::OptionManager>(td_.get().get_actor_unsafe());
+          td::G()->set_option_manager(option_manager_.get());
         });
 
     td::TdDb::open(td::Scheduler::instance()->sched_id(), parameters_, std::move(td::DbKey::empty()),
                    std::move(database_promise));
 
     td::G()->set_net_query_stats(std::make_shared<td::NetQueryStats>());
-    td::G()->set_option_manager(new td::OptionManager(std::move(td_.get().get_actor_unsafe())));
     td::G()->set_net_query_dispatcher(td::make_unique<td::NetQueryDispatcher>());
 
     td::MtprotoHeader::Options mtproto_header = {
@@ -135,11 +142,11 @@ class CoreTdApplication final : public td::NetQueryCallback {
 
     td::G()->set_mtproto_header(td::make_unique<td::MtprotoHeader>(mtproto_header));
 
-    auto tdguard = td::create_shared_lambda_guard([]() {});
-
     auto public_rsa_key = std::make_shared<td::PublicRsaKeyShared>(td::DcId::empty(), false);
 
-    auto auth_data = td::AuthDataShared::create(dc_id_, std::move(public_rsa_key), std::move(tdguard));
+    auto td_guard = td::create_shared_lambda_guard([]() {});
+
+    auto auth_data = td::AuthDataShared::create(dc_id_, std::move(public_rsa_key), std::move(td_guard));
 
     auto dc_options = td::ConnectionCreator::get_default_dc_options(false);
 
@@ -188,6 +195,7 @@ class CoreTdApplication final : public td::NetQueryCallback {
     session_.reset();
     state_manager_.reset();
     connection_creator_.reset();
+    option_manager_.reset();
     td_.reset();
 
     for (auto &response : response_promise_) {
