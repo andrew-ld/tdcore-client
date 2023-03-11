@@ -186,6 +186,9 @@ class CoreTdApplication final : public td::NetQueryCallback {
 
   void hangup() final {
     session_.reset();
+    state_manager_.reset();
+    connection_creator_.reset();
+    td_.reset();
 
     for (auto &response : response_promise_) {
       auto response_error = td::NetQueryPtr();
@@ -193,9 +196,7 @@ class CoreTdApplication final : public td::NetQueryCallback {
       response.second.set_result(std::move(response_error));
     }
 
-    state_manager_.reset();
-    connection_creator_.reset();
-    td_.reset();
+    response_promise_.clear();
   };
 };
 }  // namespace tdcore
