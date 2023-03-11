@@ -21,7 +21,10 @@
 #include "td/telegram/Td.h"
 #include "td/telegram/TdCallback.h"
 #include "td/telegram/TdParameters.h"
+#include "td/telegram/telegram_api.h"
+#include "td/utils/FlatHashMap.h"
 #include "td/utils/logging.h"
+#include "td/utils/Promise.h"
 #include "td/utils/unique_ptr.h"
 #include <algorithm>
 #include <memory>
@@ -80,13 +83,17 @@ class TdCallbackImpl : public td::TdCallback {
 class CoreTdApplication final : public td::NetQueryCallback {
  private:
   td::TdParameters parameters_;
+  td::DcId dc_id_;
+
   td::ActorOwn<td::Session> session_;
   td::ActorOwn<td::Td> td_;
   td::ActorOwn<td::StateManager> state_manager_;
   td::ActorOwn<td::ConnectionCreator> connection_creator_;
 
+  td::FlatHashMap<td::uint64, td::Promise<td::NetQueryPtr>> response_promise_;
+
  public:
-  CoreTdApplication(td::TdParameters parameters) : parameters_(parameters) {
+  CoreTdApplication(td::TdParameters parameters, td::DcId dc_id) : parameters_(parameters), dc_id_(dc_id) {
   }
 
   void start_up() final {
@@ -126,43 +133,49 @@ class CoreTdApplication final : public td::NetQueryCallback {
     };
 
     td::G()->set_mtproto_header(td::make_unique<td::MtprotoHeader>(mtproto_header));
-  }
 
-  void create_session(td::DcId dc_id) {
     auto tdguard = td::create_shared_lambda_guard([]() {});
 
     auto public_rsa_key = std::make_shared<td::PublicRsaKeyShared>(td::DcId::empty(), false);
 
-    auto auth_data = td::AuthDataShared::create(dc_id, std::move(public_rsa_key), std::move(tdguard));
+    auto auth_data = td::AuthDataShared::create(dc_id_, std::move(public_rsa_key), std::move(tdguard));
 
     auto dc_options = td::ConnectionCreator::get_default_dc_options(false);
 
     auto dc_option = std::find_if(dc_options.dc_options.begin(), dc_options.dc_options.end(),
-                                  [dc_id](td::DcOption o) { return o.get_dc_id().get_raw_id() == dc_id.get_raw_id(); });
+                                  [this](td::DcOption o) { return o.get_dc_id().get_raw_id() == dc_id_.get_raw_id(); });
 
     if (dc_option == dc_options.dc_options.end()) {
-      LOG(FATAL) << "unable to find dc option for " << dc_id.get_raw_id();
+      LOG(FATAL) << "unable to find dc option for " << dc_id_.get_raw_id();
     }
 
     auto callback = td::make_unique<TdCoreSessionCallback>(
         actor_shared(this, 1), std::move(td::DcOption(dc_option->get_dc_id(), dc_option->get_ip_address())));
 
     session_ = td::create_actor<td::Session>("MainSession", std::move(callback), std::move(auth_data),
-                                             dc_id.get_raw_id(), dc_id.get_value(), true, true, false, false, false,
+                                             dc_id_.get_raw_id(), dc_id_.get_value(), true, true, false, false, false,
                                              td::mtproto::AuthKey(), std::vector<td::mtproto::ServerSalt>());
 
-    auto query =
-        td::G()->net_query_creator().create(td::UniqueId::next(), td::telegram_api::help_getConfig(), {},
-                                            td::DcId::main(), td::NetQuery::Type::Common, td::NetQuery::AuthFlag::On);
+    td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::Other);
+  }
+
+  void perform_network_query(const td::telegram_api::Function &function, td::Promise<td::NetQueryPtr> result) {
+    const auto query_id = td::UniqueId::next();
+
+    response_promise_[query_id] = std::move(result);
+
+    auto query = td::G()->net_query_creator().create(query_id, function, {}, td::DcId::main(),
+                                                     td::NetQuery::Type::Common, td::NetQuery::AuthFlag::On);
 
     query->set_callback(actor_shared(this));
 
-    td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::Other);
     td::send_closure(session_, &td::Session::send, std::move(query));
   }
 
   void on_result(td::NetQueryPtr query) final {
-    LOG(DEBUG) << "received response" << query->tl_constructor();
+    auto response_promise = std::move(response_promise_[query->id()]);
+    response_promise_.erase(query->id());
+    response_promise.set_result(std::move(query));
   }
 
   void hangup_shared() final {
@@ -197,10 +210,19 @@ int main(int argc, char *argv[]) {
       .api_hash = "12dca97b861c78ae7437239bbf0f74f5",
   };
 
+  td::DcId dc = td::DcId::create(4);
+
   {
     auto guard = sched.get_main_guard();
-    auto with_context = td::create_actor<tdcore::CoreTdApplication>("WithContext", parameters).release();
-    td::send_closure(with_context, &tdcore::CoreTdApplication::create_session, td::DcId::create(4));
+    auto with_context = td::create_actor<tdcore::CoreTdApplication>("Application", parameters, dc).release();
+
+    auto query = td::telegram_api::help_getConfig();
+
+    auto query_promise =
+        td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result " << result->tl_constructor(); });
+
+    td::send_closure(with_context, &tdcore::CoreTdApplication::perform_network_query,
+                     td::telegram_api::help_getConfig(), std::move(query_promise));
   }
 
   sched.start();
