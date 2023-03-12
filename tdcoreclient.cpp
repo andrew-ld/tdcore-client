@@ -2,6 +2,7 @@
 #include "td/actor/impl/Actor-decl.h"
 #include "td/actor/impl/ActorId-decl.h"
 #include "td/actor/impl/Scheduler-decl.h"
+#include "td/actor/SleepActor.h"
 #include "td/db/DbKey.h"
 #include "td/td/mtproto/AuthData.h"
 #include "td/td/mtproto/AuthKey.h"
@@ -10,10 +11,8 @@
 #include "td/telegram/net/AuthDataShared.h"
 #include "td/telegram/net/ConnectionCreator.h"
 #include "td/telegram/net/DcId.h"
-#include "td/telegram/net/DcOptions.h"
 #include "td/telegram/net/MtprotoHeader.h"
 #include "td/telegram/net/NetQuery.h"
-#include "td/telegram/net/NetQueryDispatcher.h"
 #include "td/telegram/net/NetQueryStats.h"
 #include "td/telegram/net/NetStatsManager.h"
 #include "td/telegram/net/PublicRsaKeyShared.h"
@@ -39,7 +38,7 @@ using td::NetQueryCallback;
 
 class TdCoreSessionCallback final : public td::Session::Callback {
  public:
-  TdCoreSessionCallback(td::ActorShared<> parent, td::DcOption option) : parent_(std::move(parent)), option_(option) {
+  TdCoreSessionCallback(td::ActorShared<> parent, td::DcId dc_id) : parent_(std::move(parent)), dc_id_(dc_id) {
   }
   void on_failed() final {
     // nop
@@ -49,11 +48,8 @@ class TdCoreSessionCallback final : public td::Session::Callback {
   }
   void request_raw_connection(td::unique_ptr<td::mtproto::AuthData> auth_data,
                               td::Promise<td::unique_ptr<td::mtproto::RawConnection>> promise) final {
-    send_closure(
-        td::G()->connection_creator(), &td::ConnectionCreator::request_raw_connection_by_ip, option_.get_ip_address(),
-        td::mtproto::TransportType{td::mtproto::TransportType::ObfuscatedTcp,
-                                   td::narrow_cast<td::int16>(option_.get_dc_id().get_raw_id()), option_.get_secret()},
-        std::move(promise));
+    send_closure(td::G()->connection_creator(), &td::ConnectionCreator::request_raw_connection, dc_id_, false, false,
+                 std::move(promise), 1L, std::move(auth_data));
   }
   void on_tmp_auth_key_updated(td::mtproto::AuthKey auth_key) final {
     // nop
@@ -65,11 +61,17 @@ class TdCoreSessionCallback final : public td::Session::Callback {
     // nop
   }
   void on_result(td::NetQueryPtr net_query) final {
-    td::G()->net_query_dispatcher().dispatch(std::move(net_query));
+    auto callback = net_query->move_callback();
+
+    if (callback.empty()) {
+      LOG(ERROR) << "unable to find callback for query " << net_query->id();
+    } else {
+      td::send_closure_later(std::move(callback), &td::NetQueryCallback::on_result, std::move(net_query));
+    }
   }
 
  private:
-  td::DcOption option_;
+  td::DcId dc_id_;
   td::ActorShared<> parent_;
 };
 
@@ -152,7 +154,6 @@ class TdCoreApplication final : public td::Actor {
                    std::move(database_promise));
 
     td::G()->set_net_query_stats(std::make_shared<td::NetQueryStats>());
-    td::G()->set_net_query_dispatcher(td::make_unique<td::NetQueryDispatcher>());
 
     td::MtprotoHeader::Options mtproto_header = {
         .api_id = parameters_.api_id,
@@ -168,21 +169,11 @@ class TdCoreApplication final : public td::Actor {
 
     auto public_rsa_key = std::make_shared<td::PublicRsaKeyShared>(td::DcId::empty(), false);
 
-    auto td_guard = td::create_shared_lambda_guard([]() {});
+    auto td_guard = td::create_shared_lambda_guard([actor = actor_shared(this)]() {});
 
     auto auth_data = td::AuthDataShared::create(dc_id_, std::move(public_rsa_key), std::move(td_guard));
 
-    auto dc_options = td::ConnectionCreator::get_default_dc_options(false);
-
-    auto dc_option = std::find_if(dc_options.dc_options.begin(), dc_options.dc_options.end(),
-                                  [this](td::DcOption o) { return o.get_dc_id().get_raw_id() == dc_id_.get_raw_id(); });
-
-    if (dc_option == dc_options.dc_options.end()) {
-      LOG(FATAL) << "unable to find dc option for " << dc_id_.get_raw_id();
-    }
-
-    auto callback = td::make_unique<TdCoreSessionCallback>(
-        actor_shared(this, 1), std::move(td::DcOption(dc_option->get_dc_id(), dc_option->get_ip_address())));
+    auto callback = td::make_unique<TdCoreSessionCallback>(actor_shared(this), dc_id_);
 
     session_ = td::create_actor<td::Session>("MainSession", std::move(callback), std::move(auth_data),
                                              dc_id_.get_raw_id(), dc_id_.get_value(), true, true, false, false, false,
@@ -199,6 +190,18 @@ class TdCoreApplication final : public td::Actor {
         td::create_actor<TdCoreNetQueryCallback>("NetworkQueryCallback", actor_shared(this), std::move(promise)));
 
     td::send_closure(session_, &td::Session::send, std::move(query));
+  }
+
+  void close_session() {
+    td::send_closure(session_, &td::Session::close);
+  }
+
+  void stop() {
+    LOG(DEBUG) << "Application::stop received";
+  }
+
+  void hangup() {
+    LOG(DEBUG) << "Application::hangup received";
   }
 };
 }  // namespace tdcore
@@ -222,10 +225,24 @@ int main(int argc, char *argv[]) {
 
     auto app = td::create_actor<tdcore::TdCoreApplication>("Application", parameters, dc).release();
 
-    auto query = td::telegram_api::help_getConfig();
-    auto promise = td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result " << result; });
+    {
+      auto query = td::telegram_api::help_getConfig();
+      auto promise = td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result 1 " << result; });
+      td::send_closure(app, &tdcore::TdCoreApplication::perform_network_query, std::move(query), std::move(promise));
+    }
 
-    td::send_closure(app, &tdcore::TdCoreApplication::perform_network_query, std::move(query), std::move(promise));
+    auto close_promise = td::PromiseCreator::lambda(
+        [app](td::Result<td::Unit>) { td::send_closure(app, &tdcore::TdCoreApplication::close_session); });
+
+    td::create_actor<td::SleepActor>("CloseActor", 2, std::move(close_promise)).release();
+
+    auto post_close_query_promise = td::PromiseCreator::lambda([app](td::Result<td::Unit>) {
+      auto query = td::telegram_api::help_getConfig();
+      auto promise = td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result 2 " << result; });
+      td::send_closure(app, &tdcore::TdCoreApplication::perform_network_query, std::move(query), std::move(promise));
+    });
+
+    td::create_actor<td::SleepActor>("PostCloseQuery", 5, std::move(post_close_query_promise)).release();
   }
 
   sched.start();
