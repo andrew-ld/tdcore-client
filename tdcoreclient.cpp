@@ -2,6 +2,7 @@
 #include "td/actor/impl/Actor-decl.h"
 #include "td/actor/impl/ActorId-decl.h"
 #include "td/actor/impl/Scheduler-decl.h"
+#include "td/actor/SleepActor.h"
 #include "td/db/DbKey.h"
 #include "td/td/mtproto/AuthData.h"
 #include "td/td/mtproto/AuthKey.h"
@@ -19,6 +20,7 @@
 #include "td/telegram/StateManager.h"
 #include "td/telegram/Td.h"
 #include "td/telegram/TdCallback.h"
+#include "td/telegram/TdDb.h"
 #include "td/telegram/TdParameters.h"
 #include "td/telegram/telegram_api.h"
 #include "td/utils/buffer.h"
@@ -30,6 +32,7 @@
 #include "td/utils/Promise.h"
 #include "td/utils/ScopeGuard.h"
 #include "td/utils/SliceBuilder.h"
+#include "td/utils/Status.h"
 #include "td/utils/unique_ptr.h"
 #include <algorithm>
 #include <memory>
@@ -115,8 +118,9 @@ class TdCoreApplication final : public td::Actor {
 
   td::int32 shared_ref_cnt_ = 0;
 
-  td::ActorOwn<td::Session> session_;
   td::ActorOwn<td::Td> td_;
+  td::unique_ptr<td::TdDb> td_db_;
+  td::ActorOwn<td::Session> session_;
   td::ActorOwn<td::StateManager> state_manager_;
   td::ActorOwn<td::ConnectionCreator> connection_creator_;
   td::ActorOwn<td::NetStatsManager> net_stats_manager_;
@@ -129,9 +133,34 @@ class TdCoreApplication final : public td::Actor {
     return actor_shared(this, id);
   }
 
+  static const td::int32 get_database_scheduler_id() {
+    auto current_scheduler_id = td::Scheduler::instance()->sched_id();
+    auto scheduler_count = td::Scheduler::instance()->sched_count();
+    return td::min(current_scheduler_id + 1, scheduler_count - 1);
+  }
+
  public:
-  TdCoreApplication(td::TdParameters parameters, td::DcId dc_id) : parameters_(parameters), dc_id_(dc_id) {
+  TdCoreApplication(td::TdParameters parameters, td::DcId dc_id, td::unique_ptr<td::TdDb> td_db)
+      : parameters_(parameters), dc_id_(dc_id), td_db_(std::move(td_db)) {
     identifier_ = std::hash<std::string>{}(parameters.database_directory);
+  }
+
+  static void open(td::Promise<td::ActorOwn<TdCoreApplication>> promise, td::TdParameters parameters, td::DcId dc_id,
+                   td::int32 application_scheduler = 0) {
+    auto database_promise = td::PromiseCreator::lambda(
+        [=, promise = std::move(promise)](td::Result<td::TdDb::OpenedDatabase> r_opened_database) mutable {
+          if (r_opened_database.is_error()) {
+            promise.set_error(std::move(r_opened_database.move_as_error()));
+            return;
+          }
+
+          auto application = td::create_actor_on_scheduler<TdCoreApplication>(
+              "Application", application_scheduler, parameters, dc_id, r_opened_database.move_as_ok().database);
+
+          promise.set_result(std::move(application));
+        });
+
+    td::TdDb::open(get_database_scheduler_id(), parameters, td::DbKey::empty(), std::move(database_promise));
   }
 
   void start_up() final {
@@ -163,20 +192,9 @@ class TdCoreApplication final : public td::Actor {
 
     // setup database
     {
-      auto database_promise = td::PromiseCreator::lambda(
-          [actor_id = actor_id(this), this](td::Result<td::TdDb::OpenedDatabase> r_opened_database) {
-            if (r_opened_database.is_error()) {
-              LOG(FATAL) << "unable to open database " << r_opened_database.error();
-            }
-
-            td::G()->init(parameters_, std::move(td_.get()), r_opened_database.move_as_ok().database).ensure();
-
-            option_manager_ = td::make_unique<td::OptionManager>(td_.get().get_actor_unsafe());
-            td::G()->set_option_manager(option_manager_.get());
-          });
-
-      td::TdDb::open(td::Scheduler::instance()->sched_id(), parameters_, std::move(td::DbKey::empty()),
-                     std::move(database_promise));
+      td::G()->init(parameters_, std::move(td_.get()), std::move(td_db_)).ensure();
+      option_manager_ = td::make_unique<td::OptionManager>(td_.get().get_actor_unsafe());
+      td::G()->set_option_manager(option_manager_.get());
     }
 
     // setup mtproto headers
@@ -237,8 +255,8 @@ class TdCoreApplication final : public td::Actor {
   }
 
   void hangup_shared() {
-    LOG(DEBUG) << "hangup received, references: " << --shared_ref_cnt_
-               << " dereferenced id: " << get_link_token() << " identifier: " << identifier_;
+    LOG(DEBUG) << "hangup received, references: " << --shared_ref_cnt_ << " dereferenced id: " << get_link_token()
+               << " identifier: " << identifier_;
 
     if (shared_ref_cnt_ == 0 && get_link_token() == 7) {
       set_context(std::move(old_context_));
@@ -263,6 +281,7 @@ class TdCoreApplication final : public td::Actor {
     net_stats_manager_.reset();
     td_.reset();
     option_manager_.reset();
+    td_db_.reset();
 
     td::G()->set_connection_creator(td::ActorOwn<td::ConnectionCreator>());
     td::G()->set_option_manager(nullptr);
@@ -275,27 +294,41 @@ int main(int argc, char *argv[]) {
 
   td::ConcurrentScheduler sched(td::thread::hardware_concurrency(), 0);
 
-  td::DcId dc = td::DcId::create(4);
+  td::DcId dc_id = td::DcId::create(4);
+
+  td::TdParameters parameters = {
+      .database_directory = "/tmp/tdcore_database",
+      .files_directory = "/tmp/tdcore_files",
+      .api_id = 422048,
+      .api_hash = "12dca97b861c78ae7437239bbf0f74f5",
+  };
 
   {
     auto guard = sched.get_main_guard();
 
-    for (auto i = 0; i < 100; i++) {
-      td::TdParameters parameters = {
-          .database_directory = PSTRING() << "/tmp/tdcore_database" << i,
-          .files_directory = PSTRING() << "/tmp/tdcore_files" << i,
-          .api_id = 422048,
-          .api_hash = "12dca97b861c78ae7437239bbf0f74f5",
-      };
+    auto app_promise = td::PromiseCreator::lambda([](td::Result<td::ActorOwn<tdcore::TdCoreApplication>> r_app) {
+      if (r_app.is_error()) {
+        LOG(FATAL) << "unable to open TdCoreApplication: " << r_app.move_as_error().message();
+      }
 
-      auto app = td::create_actor<tdcore::TdCoreApplication>("Application", parameters, dc).release();
+      auto app = r_app.move_as_ok().release();
 
       {
         auto query = td::telegram_api::help_getConfig();
-        auto promise = td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result 1 " << result; });
-        td::send_closure(app, &tdcore::TdCoreApplication::perform_network_query, std::move(query), std::move(promise));
+
+        auto query_promise = td::PromiseCreator::lambda([](td::NetQueryPtr res) { LOG(DEBUG) << "result: " << res; });
+
+        td::send_closure(app, &tdcore::TdCoreApplication::perform_network_query, std::move(query),
+                         std::move(query_promise));
       }
-    }
+
+      auto post_close_promise =
+          td::PromiseCreator::lambda([app](td::Unit) { td::send_closure(app, &tdcore::TdCoreApplication::destroy); });
+
+      td::create_actor<td::SleepActor>("PostClose", 3, std::move(post_close_promise)).release();
+    });
+
+    tdcore::TdCoreApplication::open(std::move(app_promise), parameters, dc_id);
   }
 
   sched.start();
