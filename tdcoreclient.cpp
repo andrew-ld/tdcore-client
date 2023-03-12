@@ -22,6 +22,8 @@
 #include "td/telegram/TdParameters.h"
 #include "td/telegram/telegram_api.h"
 #include "td/utils/buffer.h"
+#include "td/utils/Hash.h"
+#include "td/utils/HashTableUtils.h"
 #include "td/utils/int_types.h"
 #include "td/utils/logging.h"
 #include "td/utils/port/thread.h"
@@ -109,6 +111,7 @@ class TdCoreApplication final : public td::Actor {
  private:
   td::TdParameters parameters_;
   td::DcId dc_id_;
+  std::uint64_t identifier_;
 
   td::int32 shared_ref_cnt_ = 0;
 
@@ -128,6 +131,7 @@ class TdCoreApplication final : public td::Actor {
 
  public:
   TdCoreApplication(td::TdParameters parameters, td::DcId dc_id) : parameters_(parameters), dc_id_(dc_id) {
+    identifier_ = std::hash<std::string>{}(parameters.database_directory);
   }
 
   void start_up() final {
@@ -135,9 +139,12 @@ class TdCoreApplication final : public td::Actor {
 
     td_ = td::create_actor<td::Td>("Td", std::move(td::make_unique<TdCallbackStub>()), td::Td::Td::Options{});
 
-    state_manager_ = td::create_actor<td::StateManager>("StateManager", create_reference(1));
-    connection_creator_ = td::create_actor<td::ConnectionCreator>("ConnectionCreator", create_reference(2));
-    net_stats_manager_ = td::create_actor<td::NetStatsManager>("NetStatsManager", create_reference(3));
+    state_manager_ =
+        td::create_actor<td::StateManager>(PSTRING() << "StateManager:" << identifier_, create_reference(1));
+    connection_creator_ =
+        td::create_actor<td::ConnectionCreator>(PSTRING() << "ConnectionCreator:" << identifier_, create_reference(2));
+    net_stats_manager_ =
+        td::create_actor<td::NetStatsManager>(PSTRING() << "NetStatsManager:" << identifier_, create_reference(3));
 
     td::G()->set_state_manager(state_manager_.get());
 
@@ -197,9 +204,10 @@ class TdCoreApplication final : public td::Actor {
 
       auto callback = td::make_unique<TdCoreSessionCallback>(create_reference(5), dc_id_, auth_data);
 
-      session_ = td::create_actor<td::Session>("MainSession", std::move(callback), std::move(auth_data),
-                                               dc_id_.get_raw_id(), dc_id_.get_value(), true, true, false, false, false,
-                                               auth_data->get_auth_key(), auth_data->get_future_salts());
+      session_ =
+          td::create_actor<td::Session>(PSTRING() << "MainSession:" << identifier_, std::move(callback),
+                                        std::move(auth_data), dc_id_.get_raw_id(), dc_id_.get_value(), true, true,
+                                        false, false, false, auth_data->get_auth_key(), auth_data->get_future_salts());
     }
 
     td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::Other);
@@ -216,8 +224,9 @@ class TdCoreApplication final : public td::Actor {
     auto query = td::G()->net_query_creator().create(td::UniqueId::next(), function, {}, dc_id_,
                                                      td::NetQuery::Type::Common, td::NetQuery::AuthFlag::On);
 
-    query->set_callback(
-        td::create_actor<TdCoreNetQueryCallback>("NetworkQueryCallback", create_reference(6), std::move(promise)));
+    query->set_callback(td::create_actor<TdCoreNetQueryCallback>(
+        PSTRING() << "NetworkQueryCallback:" << identifier_ << ":" << query->id(), create_reference(6),
+        std::move(promise)));
 
     td::send_closure(session_, &td::Session::send, std::move(query));
   }
@@ -228,8 +237,8 @@ class TdCoreApplication final : public td::Actor {
   }
 
   void hangup_shared() {
-    LOG(DEBUG) << "Application::hangup_shared received, references: " << --shared_ref_cnt_
-               << " dereferenced id: " << get_link_token();
+    LOG(DEBUG) << "hangup received, references: " << --shared_ref_cnt_
+               << " dereferenced id: " << get_link_token() << " identifier: " << identifier_;
 
     if (shared_ref_cnt_ == 0 && get_link_token() == 7) {
       set_context(std::move(old_context_));
