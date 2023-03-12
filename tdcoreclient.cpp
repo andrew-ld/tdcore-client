@@ -2,7 +2,6 @@
 #include "td/actor/impl/Actor-decl.h"
 #include "td/actor/impl/ActorId-decl.h"
 #include "td/actor/impl/Scheduler-decl.h"
-#include "td/actor/SleepActor.h"
 #include "td/db/DbKey.h"
 #include "td/td/mtproto/AuthData.h"
 #include "td/td/mtproto/AuthKey.h"
@@ -22,11 +21,13 @@
 #include "td/telegram/TdCallback.h"
 #include "td/telegram/TdParameters.h"
 #include "td/telegram/telegram_api.h"
+#include "td/utils/SliceBuilder.h"
 #include "td/utils/buffer.h"
 #include "td/utils/int_types.h"
 #include "td/utils/logging.h"
 #include "td/utils/Promise.h"
 #include "td/utils/ScopeGuard.h"
+#include "td/utils/port/thread.h"
 #include "td/utils/unique_ptr.h"
 #include <algorithm>
 #include <memory>
@@ -34,9 +35,6 @@
 #include <utility>
 
 namespace tdcore {
-using td::make_unique;
-using td::NetQueryCallback;
-
 class TdCoreSessionCallback final : public td::Session::Callback {
  public:
   TdCoreSessionCallback(td::ActorShared<> parent, td::DcId dc_id) : parent_(std::move(parent)), dc_id_(dc_id) {
@@ -76,7 +74,7 @@ class TdCoreSessionCallback final : public td::Session::Callback {
   td::ActorShared<> parent_;
 };
 
-class TdCallbackStub : public td::TdCallback {
+class TdCallbackStub final : public td::TdCallback {
  public:
   explicit TdCallbackStub() {
   }
@@ -88,7 +86,7 @@ class TdCallbackStub : public td::TdCallback {
   }
 };
 
-class TdCoreNetQueryCallback final : public NetQueryCallback {
+class TdCoreNetQueryCallback final : public td::NetQueryCallback {
  public:
   explicit TdCoreNetQueryCallback(td::ActorShared<> parent, td::Promise<td::NetQueryPtr> promise)
       : parent_(std::move(parent)), promise_(std::move(promise)) {
@@ -156,7 +154,7 @@ class TdCoreApplication final : public td::Actor {
 
           td::G()->init(parameters_, std::move(td_.get()), r_opened_database.move_as_ok().database).ensure();
 
-          option_manager_ = make_unique<td::OptionManager>(td_.get().get_actor_unsafe());
+          option_manager_ = td::make_unique<td::OptionManager>(td_.get().get_actor_unsafe());
           td::G()->set_option_manager(option_manager_.get());
         });
 
@@ -251,33 +249,29 @@ class TdCoreApplication final : public td::Actor {
 int main(int argc, char *argv[]) {
   SET_VERBOSITY_LEVEL(VERBOSITY_NAME(DEBUG));
 
-  td::ConcurrentScheduler sched(4, 0);
-
-  td::TdParameters parameters = {
-      .database_directory = "/tmp/tdcore_database",
-      .files_directory = "/tmp/tdcore_files",
-      .api_id = 422048,
-      .api_hash = "12dca97b861c78ae7437239bbf0f74f5",
-  };
+  td::ConcurrentScheduler sched(td::thread::hardware_concurrency(), 0);
 
   td::DcId dc = td::DcId::create(4);
 
   {
     auto guard = sched.get_main_guard();
 
-    auto app = td::create_actor<tdcore::TdCoreApplication>("Application", parameters, dc).release();
+    for (auto i = 0; i < 100; i++) {
+      td::TdParameters parameters = {
+          .database_directory = PSTRING() << "/tmp/tdcore_database" << i,
+          .files_directory = PSTRING() << "/tmp/tdcore_files" << i,
+          .api_id = 422048,
+          .api_hash = "12dca97b861c78ae7437239bbf0f74f5",
+      };
 
-    {
-      auto query = td::telegram_api::help_getConfig();
-      auto promise = td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result 1 " << result; });
+      auto app = td::create_actor<tdcore::TdCoreApplication>("Application", parameters, dc).release();
 
-      td::send_closure(app, &tdcore::TdCoreApplication::perform_network_query, std::move(query), std::move(promise));
+      {
+        auto query = td::telegram_api::help_getConfig();
+        auto promise = td::PromiseCreator::lambda([](td::NetQueryPtr result) { LOG(DEBUG) << "result 1 " << result; });
+        td::send_closure(app, &tdcore::TdCoreApplication::perform_network_query, std::move(query), std::move(promise));
+      }
     }
-
-    auto close_promise = td::PromiseCreator::lambda(
-        [app](td::Result<td::Unit>) { td::send_closure(app, &tdcore::TdCoreApplication::destroy); });
-
-    td::create_actor<td::SleepActor>("CloseActor", 2, std::move(close_promise)).release();
   }
 
   sched.start();
