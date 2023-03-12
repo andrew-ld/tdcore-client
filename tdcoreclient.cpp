@@ -21,13 +21,13 @@
 #include "td/telegram/TdCallback.h"
 #include "td/telegram/TdParameters.h"
 #include "td/telegram/telegram_api.h"
-#include "td/utils/SliceBuilder.h"
 #include "td/utils/buffer.h"
 #include "td/utils/int_types.h"
 #include "td/utils/logging.h"
+#include "td/utils/port/thread.h"
 #include "td/utils/Promise.h"
 #include "td/utils/ScopeGuard.h"
-#include "td/utils/port/thread.h"
+#include "td/utils/SliceBuilder.h"
 #include "td/utils/unique_ptr.h"
 #include <algorithm>
 #include <memory>
@@ -37,13 +37,15 @@
 namespace tdcore {
 class TdCoreSessionCallback final : public td::Session::Callback {
  public:
-  TdCoreSessionCallback(td::ActorShared<> parent, td::DcId dc_id) : parent_(std::move(parent)), dc_id_(dc_id) {
+  TdCoreSessionCallback(td::ActorShared<> parent, td::DcId dc_id, std::shared_ptr<td::AuthDataShared> auth_data)
+      : parent_(std::move(parent)), dc_id_(dc_id), auth_data_(std::move(auth_data)) {
   }
   void on_failed() final {
     // nop
   }
   void on_closed() final {
     parent_.reset();
+    auth_data_.reset();
   }
   void request_raw_connection(td::unique_ptr<td::mtproto::AuthData> auth_data,
                               td::Promise<td::unique_ptr<td::mtproto::RawConnection>> promise) final {
@@ -54,7 +56,7 @@ class TdCoreSessionCallback final : public td::Session::Callback {
     // nop
   }
   void on_server_salt_updated(std::vector<td::mtproto::ServerSalt> server_salts) final {
-    // nop
+    auth_data_->set_future_salts(std::move(server_salts));
   }
   void on_update(td::BufferSlice &&update, td::uint64 auth_key_id) final {
     // nop
@@ -72,6 +74,7 @@ class TdCoreSessionCallback final : public td::Session::Callback {
  private:
   td::DcId dc_id_;
   td::ActorShared<> parent_;
+  std::shared_ptr<td::AuthDataShared> auth_data_;
 };
 
 class TdCallbackStub final : public td::TdCallback {
@@ -179,13 +182,13 @@ class TdCoreApplication final : public td::Actor {
 
     auto td_guard = td::create_shared_lambda_guard([actor = create_reference(4)]() {});
 
-    auto auth_data = td::AuthDataShared::create(dc_id_, std::move(public_rsa_key), std::move(td_guard));
+    auto auth_data = td::AuthDataShared::create(dc_id_, std::move(public_rsa_key), td_guard);
 
-    auto callback = td::make_unique<TdCoreSessionCallback>(create_reference(5), dc_id_);
+    auto callback = td::make_unique<TdCoreSessionCallback>(create_reference(5), dc_id_, auth_data);
 
     session_ = td::create_actor<td::Session>("MainSession", std::move(callback), std::move(auth_data),
                                              dc_id_.get_raw_id(), dc_id_.get_value(), true, true, false, false, false,
-                                             td::mtproto::AuthKey(), std::vector<td::mtproto::ServerSalt>());
+                                             auth_data->get_auth_key(), auth_data->get_future_salts());
 
     td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::Other);
   }
@@ -198,7 +201,7 @@ class TdCoreApplication final : public td::Actor {
       return;
     }
 
-    auto query = td::G()->net_query_creator().create(td::UniqueId::next(), function, {}, td::DcId::main(),
+    auto query = td::G()->net_query_creator().create(td::UniqueId::next(), function, {}, dc_id_,
                                                      td::NetQuery::Type::Common, td::NetQuery::AuthFlag::On);
 
     query->set_callback(
