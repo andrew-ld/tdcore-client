@@ -211,6 +211,7 @@ class TdCoreApplication final : public td::Actor {
                << " dereferenced id: " << get_link_token();
 
     if (shared_ref_cnt_ == 0 && get_link_token() == 7) {
+      set_context(std::move(old_context_));
       stop();
       return;
     }
@@ -236,10 +237,6 @@ class TdCoreApplication final : public td::Actor {
     td::G()->set_connection_creator(td::ActorOwn<td::ConnectionCreator>());
     td::G()->set_option_manager(nullptr);
     td::G()->set_close_flag();
-  }
-
-  void stop() {
-    set_context(old_context_);
   }
 };
 }  // namespace tdcore
