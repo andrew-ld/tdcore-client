@@ -139,56 +139,68 @@ class TdCoreApplication final : public td::Actor {
     connection_creator_ = td::create_actor<td::ConnectionCreator>("ConnectionCreator", create_reference(2));
     net_stats_manager_ = td::create_actor<td::NetStatsManager>("NetStatsManager", create_reference(3));
 
-    auto net_stats_manager_ptr = net_stats_manager_.get_actor_unsafe();
-    net_stats_manager_ptr->init();
-
-    connection_creator_.get_actor_unsafe()->set_net_stats_callback(net_stats_manager_ptr->get_common_stats_callback(),
-                                                                   net_stats_manager_ptr->get_media_stats_callback());
-
     td::G()->set_state_manager(state_manager_.get());
-    td::G()->set_connection_creator(std::move(connection_creator_));
-    td::G()->set_net_stats_file_callbacks(net_stats_manager_ptr->get_file_stats_callbacks());
 
-    auto database_promise = td::PromiseCreator::lambda(
-        [actor_id = actor_id(this), this](td::Result<td::TdDb::OpenedDatabase> r_opened_database) {
-          if (r_opened_database.is_error()) {
-            LOG(FATAL) << "unable to open database " << r_opened_database.error();
-          }
+    // setup network stats
+    {
+      auto net_stats_manager_ptr = net_stats_manager_.get_actor_unsafe();
+      net_stats_manager_ptr->init();
 
-          td::G()->init(parameters_, std::move(td_.get()), r_opened_database.move_as_ok().database).ensure();
+      connection_creator_.get_actor_unsafe()->set_net_stats_callback(net_stats_manager_ptr->get_common_stats_callback(),
+                                                                     net_stats_manager_ptr->get_media_stats_callback());
 
-          option_manager_ = td::make_unique<td::OptionManager>(td_.get().get_actor_unsafe());
-          td::G()->set_option_manager(option_manager_.get());
-        });
+      td::G()->set_net_stats_file_callbacks(net_stats_manager_ptr->get_file_stats_callbacks());
+      td::G()->set_net_query_stats(std::make_shared<td::NetQueryStats>());
+      td::G()->set_connection_creator(std::move(connection_creator_));
+    }
 
-    td::TdDb::open(td::Scheduler::instance()->sched_id(), parameters_, std::move(td::DbKey::empty()),
-                   std::move(database_promise));
+    // setup database
+    {
+      auto database_promise = td::PromiseCreator::lambda(
+          [actor_id = actor_id(this), this](td::Result<td::TdDb::OpenedDatabase> r_opened_database) {
+            if (r_opened_database.is_error()) {
+              LOG(FATAL) << "unable to open database " << r_opened_database.error();
+            }
 
-    td::G()->set_net_query_stats(std::make_shared<td::NetQueryStats>());
+            td::G()->init(parameters_, std::move(td_.get()), r_opened_database.move_as_ok().database).ensure();
 
-    td::MtprotoHeader::Options mtproto_header = {
-        .api_id = parameters_.api_id,
-        .system_language_code = "en",
-        .device_model = "tdcore",
-        .system_version = "1",
-        .application_version = "1",
-        .language_pack = "en",
-        .language_code = "en",
-    };
+            option_manager_ = td::make_unique<td::OptionManager>(td_.get().get_actor_unsafe());
+            td::G()->set_option_manager(option_manager_.get());
+          });
 
-    td::G()->set_mtproto_header(td::make_unique<td::MtprotoHeader>(mtproto_header));
+      td::TdDb::open(td::Scheduler::instance()->sched_id(), parameters_, std::move(td::DbKey::empty()),
+                     std::move(database_promise));
+    }
 
-    auto public_rsa_key = std::make_shared<td::PublicRsaKeyShared>(td::DcId::empty(), false);
+    // setup mtproto headers
+    {
+      td::MtprotoHeader::Options mtproto_header = {
+          .api_id = parameters_.api_id,
+          .system_language_code = "en",
+          .device_model = "tdcore",
+          .system_version = "1",
+          .application_version = "1",
+          .language_pack = "en",
+          .language_code = "en",
+      };
 
-    auto td_guard = td::create_shared_lambda_guard([actor = create_reference(4)]() {});
+      td::G()->set_mtproto_header(td::make_unique<td::MtprotoHeader>(mtproto_header));
+    }
 
-    auto auth_data = td::AuthDataShared::create(dc_id_, std::move(public_rsa_key), td_guard);
+    // setup session
+    {
+      auto public_rsa_key = std::make_shared<td::PublicRsaKeyShared>(td::DcId::empty(), false);
 
-    auto callback = td::make_unique<TdCoreSessionCallback>(create_reference(5), dc_id_, auth_data);
+      auto td_guard = td::create_shared_lambda_guard([actor = create_reference(4)]() {});
 
-    session_ = td::create_actor<td::Session>("MainSession", std::move(callback), std::move(auth_data),
-                                             dc_id_.get_raw_id(), dc_id_.get_value(), true, true, false, false, false,
-                                             auth_data->get_auth_key(), auth_data->get_future_salts());
+      auto auth_data = td::AuthDataShared::create(dc_id_, std::move(public_rsa_key), td_guard);
+
+      auto callback = td::make_unique<TdCoreSessionCallback>(create_reference(5), dc_id_, auth_data);
+
+      session_ = td::create_actor<td::Session>("MainSession", std::move(callback), std::move(auth_data),
+                                               dc_id_.get_raw_id(), dc_id_.get_value(), true, true, false, false, false,
+                                               auth_data->get_auth_key(), auth_data->get_future_salts());
+    }
 
     td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::Other);
   }
