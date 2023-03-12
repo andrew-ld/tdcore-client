@@ -24,8 +24,6 @@
 #include "td/telegram/TdParameters.h"
 #include "td/telegram/telegram_api.h"
 #include "td/utils/buffer.h"
-#include "td/utils/Hash.h"
-#include "td/utils/HashTableUtils.h"
 #include "td/utils/int_types.h"
 #include "td/utils/logging.h"
 #include "td/utils/port/thread.h"
@@ -255,7 +253,9 @@ class TdCoreApplication final : public td::Actor {
   }
 
   void hangup_shared() {
-    LOG(DEBUG) << "hangup received, references: " << --shared_ref_cnt_ << " dereferenced id: " << get_link_token()
+    shared_ref_cnt_--;
+
+    LOG(DEBUG) << "hangup received, references: " << shared_ref_cnt_ << " dereferenced id: " << get_link_token()
                << " identifier: " << identifier_;
 
     if (shared_ref_cnt_ == 0 && get_link_token() == 7) {
@@ -296,39 +296,45 @@ int main(int argc, char *argv[]) {
 
   td::DcId dc_id = td::DcId::create(4);
 
-  td::TdParameters parameters = {
-      .database_directory = "/tmp/tdcore_database",
-      .files_directory = "/tmp/tdcore_files",
-      .api_id = 422048,
-      .api_hash = "12dca97b861c78ae7437239bbf0f74f5",
-  };
-
   {
     auto guard = sched.get_main_guard();
 
-    auto app_promise = td::PromiseCreator::lambda([](td::Result<td::ActorOwn<tdcore::TdCoreApplication>> r_app) {
-      if (r_app.is_error()) {
-        LOG(FATAL) << "unable to open TdCoreApplication: " << r_app.move_as_error().message();
-      }
+    for (auto count = 0; count < 500; count++) {
+      td::TdParameters parameters = {
+          .database_directory = PSTRING() << "/tmp/tdcore_database" << count,
+          .files_directory = PSTRING() << "/tmp/tdcore_files" << count,
+          .api_id = 422048,
+          .api_hash = "12dca97b861c78ae7437239bbf0f74f5",
+      };
 
-      auto app = r_app.move_as_ok().release();
+      auto app_promise = td::PromiseCreator::lambda([](td::Result<td::ActorOwn<tdcore::TdCoreApplication>> r_app) {
+        if (r_app.is_error()) {
+          LOG(FATAL) << "unable to open TdCoreApplication: " << r_app.move_as_error().message();
+        }
 
-      {
-        auto query = td::telegram_api::help_getConfig();
+        auto app = r_app.move_as_ok().release();
 
-        auto query_promise = td::PromiseCreator::lambda([](td::NetQueryPtr res) { LOG(DEBUG) << "result: " << res; });
+        {
+          auto query = td::telegram_api::help_getConfig();
 
-        td::send_closure(app, &tdcore::TdCoreApplication::perform_network_query, std::move(query),
-                         std::move(query_promise));
-      }
+          auto query_promise = td::PromiseCreator::lambda([](td::NetQueryPtr res) { LOG(DEBUG) << "result: " << res; });
 
-      auto post_close_promise =
-          td::PromiseCreator::lambda([app](td::Unit) { td::send_closure(app, &tdcore::TdCoreApplication::destroy); });
+          td::send_closure(app, &tdcore::TdCoreApplication::perform_network_query, std::move(query),
+                           std::move(query_promise));
+        }
 
-      td::create_actor<td::SleepActor>("PostClose", 3, std::move(post_close_promise)).release();
-    });
+        auto post_close_promise =
+            td::PromiseCreator::lambda([app](td::Unit) { td::send_closure(app, &tdcore::TdCoreApplication::destroy); });
 
-    tdcore::TdCoreApplication::open(std::move(app_promise), parameters, dc_id);
+        td::create_actor<td::SleepActor>("PostClose", 5, std::move(post_close_promise)).release();
+      });
+
+      tdcore::TdCoreApplication::open(std::move(app_promise), parameters, dc_id);
+    }
+
+    auto destroy_promise = td::PromiseCreator::lambda([](td::Unit) { td::Scheduler::instance()->finish(); });
+
+    td::create_actor<td::SleepActor>("Destroy", 10, std::move(destroy_promise)).release();
   }
 
   sched.start();
