@@ -264,7 +264,7 @@ class TdCoreApplication final : public td::Actor {
       return;
     }
 
-    if (shared_ref_cnt_ == 0 && get_link_token() != 7) {
+    if (shared_ref_cnt_ == 0) {
       td::Promise<> close_db_promise =
           td::PromiseCreator::lambda([actor_id = create_reference(7)](td::Unit) mutable { actor_id.reset(); });
 
@@ -296,10 +296,12 @@ int main(int argc, char *argv[]) {
 
   td::DcId dc_id = td::DcId::create(4);
 
+  const auto max_application_scheduler = td::max(td::thread::hardware_concurrency() - 1, 1u);
+
   {
     auto guard = sched.get_main_guard();
 
-    for (auto count = 0; count < 500; count++) {
+    for (auto count = 0; count < 50; count++) {
       td::TdParameters parameters = {
           .database_directory = PSTRING() << "/tmp/tdcore_database" << count,
           .files_directory = PSTRING() << "/tmp/tdcore_files" << count,
@@ -329,7 +331,7 @@ int main(int argc, char *argv[]) {
         td::create_actor<td::SleepActor>("PostClose", 5, std::move(post_close_promise)).release();
       });
 
-      tdcore::TdCoreApplication::open(std::move(app_promise), parameters, dc_id);
+      tdcore::TdCoreApplication::open(std::move(app_promise), parameters, dc_id, count % max_application_scheduler);
     }
 
     auto destroy_promise = td::PromiseCreator::lambda([](td::Unit) { td::Scheduler::instance()->finish(); });
