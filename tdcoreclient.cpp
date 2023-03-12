@@ -193,6 +193,13 @@ class TdCoreApplication final : public td::Actor {
   }
 
   void perform_network_query(const td::telegram_api::Function &function, td::Promise<td::NetQueryPtr> promise) {
+    const auto has_closed = td::Scheduler::context()->get_id() != td::Global::ID || td::G()->close_flag();
+
+    if (has_closed) {
+      promise.set_error(td::Status::Error(202, "Client distroyed"));
+      return;
+    }
+
     auto query = td::G()->net_query_creator().create(td::UniqueId::next(), function, {}, td::DcId::main(),
                                                      td::NetQuery::Type::Common, td::NetQuery::AuthFlag::On);
 
@@ -203,6 +210,7 @@ class TdCoreApplication final : public td::Actor {
   }
 
   void destroy() {
+    td::G()->set_close_flag();
     td::send_closure(session_, &td::Session::close);
   }
 
@@ -236,7 +244,6 @@ class TdCoreApplication final : public td::Actor {
 
     td::G()->set_connection_creator(td::ActorOwn<td::ConnectionCreator>());
     td::G()->set_option_manager(nullptr);
-    td::G()->set_close_flag();
   }
 };
 }  // namespace tdcore
