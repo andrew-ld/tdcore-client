@@ -4,7 +4,7 @@ cmake_policy(SET CMP0079 NEW)
 
 add_subdirectory(td EXCLUDE_FROM_ALL)
 
-add_executable(tdcoreclient tdcoreclient.cpp)
+add_library(tdcoreclient tdcoreclient.cpp)
 
 target_link_libraries(tdcoreclient PRIVATE tdcore)
 get_target_property(private_include_dirs tdcore INCLUDE_DIRECTORIES)
