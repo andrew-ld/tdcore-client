@@ -115,7 +115,7 @@ TdCoreClient::TdCoreClient(td::TdParameters parameters, td::DcId dc_id, td::uniq
   identifier_ = std::hash<std::string>{}(parameters.database_directory);
 }
 
-static void open(td::Promise<td::ActorOwn<TdCoreClient>> promise, td::TdParameters parameters, td::DcId dc_id,
+void TdCoreClient::open(td::Promise<td::ActorOwn<TdCoreClient>> promise, td::TdParameters parameters, td::DcId dc_id,
                  td::int32 application_scheduler, td::int32 database_scheduler) {
   auto database_promise = td::PromiseCreator::lambda(
       [=, promise = std::move(promise)](td::Result<td::TdDb::OpenedDatabase> r_opened_database) mutable {
