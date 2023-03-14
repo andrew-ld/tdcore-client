@@ -62,7 +62,7 @@ class TdCoreRawConnectionCallbackWrapper final : public td::mtproto::RawConnecti
       td::TlParser parser(packet.as_slice().substr(MESSAGE_HEADER_SIZE));
       const td::int32 tl_constructor = parser.fetch_int();
 
-      if (!parser.get_error() && tl_constructor != RPC_RESULT_ID) {
+      if (!parser.get_error() && tl_constructor == RPC_RESULT_ID) {
         const td::int64 msg_id = parser.fetch_long();
 
         const td::int32 tl_constructor_result = parser.fetch_int();
@@ -145,7 +145,7 @@ class TdCoreRawConnectionWrapper final : public td::mtproto::RawConnection {
   }
 
   td::Status flush(const td::mtproto::AuthKey &auth_key, Callback &callback) override {
-    return child_->flush(auth_key, *td::make_unique<TdCoreRawConnectionCallbackWrapper>(callback));
+    return child_->flush(auth_key, *std::move(td::make_unique<TdCoreRawConnectionCallbackWrapper>(callback)));
   }
 
   void set_connection_token(td::mtproto::ConnectionManager::ConnectionToken connection_token) override {
@@ -173,7 +173,7 @@ class TdCoreSessionCallback final : public td::Session::Callback {
             return promise.set_error(raw_connection.move_as_error());
           }
 
-          promise.set_result(td::make_unique<TdCoreRawConnectionWrapper>(raw_connection.move_as_ok()));
+          promise.set_result(std::move(td::make_unique<TdCoreRawConnectionWrapper>(raw_connection.move_as_ok())));
         });
 
     send_closure(td::G()->connection_creator(), &td::ConnectionCreator::request_raw_connection, dc_id_, false, false,
