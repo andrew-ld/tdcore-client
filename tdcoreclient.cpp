@@ -1,6 +1,7 @@
 #include "td/actor/impl/ActorId-decl.h"
 #include "td/actor/impl/Scheduler-decl.h"
 #include "td/db/DbKey.h"
+#include "td/mtproto/RawConnection.h"
 #include "td/td/mtproto/AuthData.h"
 #include "td/td/mtproto/AuthKey.h"
 #include "td/td/telegram/net/Session.h"
@@ -20,13 +21,16 @@
 #include "td/telegram/TdDb.h"
 #include "td/telegram/TdParameters.h"
 #include "td/telegram/telegram_api.h"
+#include "td/tl/tl_object_store.h"
 #include "td/utils/buffer.h"
 #include "td/utils/int_types.h"
 #include "td/utils/logging.h"
 #include "td/utils/Promise.h"
 #include "td/utils/ScopeGuard.h"
+#include "td/utils/Slice-decl.h"
 #include "td/utils/SliceBuilder.h"
 #include "td/utils/Status.h"
+#include "td/utils/tl_parsers.h"
 #include "td/utils/unique_ptr.h"
 #include "tdcoreclient.h"
 #include <algorithm>
@@ -35,6 +39,120 @@
 #include <utility>
 
 namespace tdcore {
+class TdCoreRawConnectionCallbackWrapper final : public td::mtproto::RawConnection::Callback {
+ private:
+  static const auto RPC_RESULT_ID = -212046591;
+
+  static const auto MESSAGE_HEADER_SIZE = sizeof(td::int32) + sizeof(td::int64) + sizeof(td::int32);
+
+  static const auto RPC_RESULT_BODY_HEADER_SIZE = MESSAGE_HEADER_SIZE + sizeof(td::int32) + sizeof(td::int64);
+
+  Callback &child_;
+
+ public:
+  TdCoreRawConnectionCallbackWrapper(Callback &child) : child_(child) {
+  }
+
+  td::Status before_write() override {
+    return child_.before_write();
+  }
+
+  td::Status on_raw_packet(const td::mtproto::PacketInfo &info, td::BufferSlice packet) override {
+    if (!info.no_crypto_flag && packet.size() > RPC_RESULT_BODY_HEADER_SIZE) {
+      td::TlParser parser(packet.as_slice().substr(MESSAGE_HEADER_SIZE));
+      const td::int32 tl_constructor = parser.fetch_int();
+
+      if (!parser.get_error() && tl_constructor != RPC_RESULT_ID) {
+        const td::int64 msg_id = parser.fetch_long();
+
+        const td::int32 tl_constructor_result = parser.fetch_int();
+
+        const auto is_broken = tl_constructor_result == td::telegram_api::auth_authorization::ID ||
+                               tl_constructor_result == td::telegram_api::auth_loginTokenSuccess::ID;
+
+        if (is_broken && !parser.get_error()) {
+          LOG(ERROR) << "received authorization response " << msg_id << " returning a placeholder";
+
+          td::MutableSlice placeholder = packet.as_mutable_slice();
+          td::TlStorerUnsafe placeholder_storer(placeholder.substr(RPC_RESULT_BODY_HEADER_SIZE).ubegin());
+          td::TlStoreBool::store(true, placeholder_storer);
+
+          return child_.on_raw_packet(info, std::move(td::BufferSlice(placeholder)));
+        }
+      }
+    }
+
+    return child_.on_raw_packet(info, std::move(packet));
+  }
+
+  void on_read(size_t size) override {
+    child_.on_read(size);
+  }
+
+  td::Status on_quick_ack(td::uint64 quick_ack_token) override {
+    return child_.on_quick_ack(quick_ack_token);
+  }
+};
+
+class TdCoreRawConnectionWrapper final : public td::mtproto::RawConnection {
+ private:
+  td::unique_ptr<RawConnection> child_;
+
+ public:
+  TdCoreRawConnectionWrapper(td::unique_ptr<RawConnection> child) : child_(std::move(child)) {
+  }
+
+  void close() override {
+    child_->close();
+    child_.reset();
+  }
+
+  PublicFields &extra() override {
+    return child_->extra();
+  }
+
+  StatsCallback *stats_callback() override {
+    return child_->stats_callback();
+  }
+
+  bool can_send() const override {
+    return child_->can_send();
+  }
+
+  const PublicFields &extra() const override {
+    return child_->extra();
+  }
+
+  td::PollableFdInfo &get_poll_info() override {
+    return child_->get_poll_info();
+  }
+
+  bool has_error() const override {
+    return child_->has_error();
+  }
+
+  td::mtproto::TransportType get_transport_type() const override {
+    return child_->get_transport_type();
+  }
+
+  td::uint64 send_no_crypto(const td::Storer &storer) override {
+    return child_->send_no_crypto(storer);
+  }
+
+  size_t send_crypto(const td::Storer &storer, td::int64 session_id, td::int64 salt,
+                     const td::mtproto::AuthKey &auth_key, td::uint64 quick_ack_token) override {
+    return child_->send_crypto(storer, session_id, salt, auth_key, quick_ack_token);
+  }
+
+  td::Status flush(const td::mtproto::AuthKey &auth_key, Callback &callback) override {
+    return child_->flush(auth_key, *td::make_unique<TdCoreRawConnectionCallbackWrapper>(callback));
+  }
+
+  void set_connection_token(td::mtproto::ConnectionManager::ConnectionToken connection_token) override {
+    child_->set_connection_token(std::move(connection_token));
+  }
+};
+
 class TdCoreSessionCallback final : public td::Session::Callback {
  public:
   TdCoreSessionCallback(td::ActorShared<> parent, td::DcId dc_id, std::shared_ptr<td::AuthDataShared> auth_data)
@@ -49,8 +167,17 @@ class TdCoreSessionCallback final : public td::Session::Callback {
   }
   void request_raw_connection(td::unique_ptr<td::mtproto::AuthData> auth_data,
                               td::Promise<td::unique_ptr<td::mtproto::RawConnection>> promise) final {
+    auto wrapped_promise = td::PromiseCreator::lambda(
+        [promise = std::move(promise)](td::Result<td::unique_ptr<td::mtproto::RawConnection>> raw_connection) mutable {
+          if (raw_connection.is_error()) {
+            return promise.set_error(raw_connection.move_as_error());
+          }
+
+          promise.set_result(td::make_unique<TdCoreRawConnectionWrapper>(raw_connection.move_as_ok()));
+        });
+
     send_closure(td::G()->connection_creator(), &td::ConnectionCreator::request_raw_connection, dc_id_, false, false,
-                 std::move(promise), 1L, std::move(auth_data));
+                 std::move(wrapped_promise), 1L, std::move(auth_data));
   }
   void on_tmp_auth_key_updated(td::mtproto::AuthKey auth_key) final {
     // nop
@@ -116,7 +243,7 @@ TdCoreClient::TdCoreClient(td::TdParameters parameters, td::DcId dc_id, td::uniq
 }
 
 void TdCoreClient::open(td::Promise<td::ActorOwn<TdCoreClient>> promise, td::TdParameters parameters, td::DcId dc_id,
-                 td::int32 application_scheduler, td::int32 database_scheduler) {
+                        td::int32 application_scheduler, td::int32 database_scheduler) {
   auto database_promise = td::PromiseCreator::lambda(
       [=, promise = std::move(promise)](td::Result<td::TdDb::OpenedDatabase> r_opened_database) mutable {
         if (r_opened_database.is_error()) {
@@ -124,8 +251,8 @@ void TdCoreClient::open(td::Promise<td::ActorOwn<TdCoreClient>> promise, td::TdP
           return;
         }
 
-        auto application = td::create_actor_on_scheduler<TdCoreClient>(
-            "Application", application_scheduler, parameters, dc_id, r_opened_database.move_as_ok().database);
+        auto application = td::create_actor_on_scheduler<TdCoreClient>("Application", application_scheduler, parameters,
+                                                                       dc_id, r_opened_database.move_as_ok().database);
 
         promise.set_result(std::move(application));
       });
@@ -200,7 +327,7 @@ void TdCoreClient::start_up() {
 }
 
 void TdCoreClient::perform_network_query(const td::telegram_api::Function &function,
-                                              td::Promise<td::NetQueryPtr> promise) {
+                                         td::Promise<td::NetQueryPtr> promise) {
   const auto has_closed = td::Scheduler::context()->get_id() != td::Global::ID || td::G()->close_flag();
 
   if (has_closed) {
