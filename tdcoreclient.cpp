@@ -22,6 +22,7 @@
 #include "td/telegram/TdParameters.h"
 #include "td/telegram/telegram_api.h"
 #include "td/tl/tl_object_store.h"
+#include "td/tl/TlObject.h"
 #include "td/utils/buffer.h"
 #include "td/utils/int_types.h"
 #include "td/utils/logging.h"
@@ -324,8 +325,7 @@ void TdCoreClient::start_up() {
   }
 }
 
-
-void TdCoreClient::perform_network_query(const td::telegram_api::Function &function,
+void TdCoreClient::perform_network_query(td::tl_object_ptr<td::telegram_api::Function> function,
                                          td::Promise<td::NetQueryPtr> promise) {
   const auto has_closed = td::Scheduler::context()->get_id() != td::Global::ID || td::G()->close_flag();
 
@@ -334,7 +334,7 @@ void TdCoreClient::perform_network_query(const td::telegram_api::Function &funct
     return;
   }
 
-  auto query = td::G()->net_query_creator().create(td::UniqueId::next(), function, {}, dc_id_,
+  auto query = td::G()->net_query_creator().create(td::UniqueId::next(), std::move(*function.release()), {}, dc_id_,
                                                    td::NetQuery::Type::Common, td::NetQuery::AuthFlag::On);
 
   query->set_callback(td::create_actor<TdCoreNetQueryCallback>(

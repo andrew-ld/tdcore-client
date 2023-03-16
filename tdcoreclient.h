@@ -38,8 +38,8 @@ class TdCoreClient final : public td::Actor {
   static void open(td::Promise<td::ActorOwn<TdCoreClient>> promise, td::TdParameters parameters, td::DcId dc_id,
                    td::int32 application_scheduler, td::int32 database_scheduler);
 
-  virtual void perform_network_query(const td::telegram_api::Function &function,
-                                     td::Promise<td::NetQueryPtr> promise) final;
+  virtual void perform_network_query(td::tl_object_ptr<td::telegram_api::Function> function,
+                                     td::Promise<td::NetQueryPtr> promise);
 
   virtual void disconnect() final {
     td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::None);
