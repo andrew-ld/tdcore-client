@@ -322,9 +322,8 @@ void TdCoreClient::start_up() {
         PSTRING() << "MainSession:" << identifier_, std::move(callback), std::move(auth_data), dc_id_.get_raw_id(),
         dc_id_.get_value(), true, true, false, false, false, auth_data->get_auth_key(), auth_data->get_future_salts());
   }
-
-  td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::Other);
 }
+
 
 void TdCoreClient::perform_network_query(const td::telegram_api::Function &function,
                                          td::Promise<td::NetQueryPtr> promise) {

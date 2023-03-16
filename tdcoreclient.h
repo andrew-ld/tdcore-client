@@ -6,6 +6,7 @@
 #include "td/telegram/net/NetStatsManager.h"
 #include "td/telegram/net/Session.h"
 #include "td/telegram/OptionManager.h"
+#include "td/telegram/StateManager.h"
 #include "td/telegram/TdDb.h"
 #include "td/telegram/TdParameters.h"
 #include "td/telegram/telegram_api.h"
@@ -39,6 +40,14 @@ class TdCoreClient final : public td::Actor {
 
   virtual void perform_network_query(const td::telegram_api::Function &function,
                                      td::Promise<td::NetQueryPtr> promise) final;
+
+  virtual void disconnect() final {
+    td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::None);
+  };
+
+  virtual void reconnect() final {
+    td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::Other);
+  };
 
   virtual void destroy() final;
 
