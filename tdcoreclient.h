@@ -30,7 +30,7 @@ class TdCoreClient final : public td::Actor {
 
   std::shared_ptr<td::ActorContext> old_context_;
 
-  virtual td::ActorShared<> create_reference(td::uint64 id) final;
+  virtual td::ActorShared<TdCoreClient> create_reference(td::uint64 id) final;
 
  public:
   TdCoreClient(td::TdParameters parameters, td::DcId dc_id, td::unique_ptr<td::TdDb> td_db);
@@ -41,13 +41,9 @@ class TdCoreClient final : public td::Actor {
   virtual void perform_network_query(td::tl_object_ptr<td::telegram_api::Function> function,
                                      td::Promise<td::NetQueryPtr> promise);
 
-  virtual void disconnect() final {
-    td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::None);
-  };
+  virtual void disconnect() final;
 
-  virtual void reconnect() final {
-    td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::Other);
-  };
+  virtual void reconnect() final;
 
   virtual void destroy() final;
 

@@ -156,16 +156,20 @@ class TdCoreRawConnectionWrapper final : public td::mtproto::RawConnection {
 
 class TdCoreSessionCallback final : public td::Session::Callback {
  public:
-  TdCoreSessionCallback(td::ActorShared<> parent, td::DcId dc_id, std::shared_ptr<td::AuthDataShared> auth_data)
+  TdCoreSessionCallback(td::ActorShared<TdCoreClient> parent, td::DcId dc_id,
+                        std::shared_ptr<td::AuthDataShared> auth_data)
       : parent_(std::move(parent)), dc_id_(dc_id), auth_data_(std::move(auth_data)) {
   }
+
   void on_failed() final {
-    // nop
+    td::send_closure(parent_.get(), &TdCoreClient::destroy);
   }
+
   void on_closed() final {
     parent_.reset();
     auth_data_.reset();
   }
+
   void request_raw_connection(td::unique_ptr<td::mtproto::AuthData> auth_data,
                               td::Promise<td::unique_ptr<td::mtproto::RawConnection>> promise) final {
     auto wrapped_promise = td::PromiseCreator::lambda(
@@ -180,15 +184,19 @@ class TdCoreSessionCallback final : public td::Session::Callback {
     send_closure(td::G()->connection_creator(), &td::ConnectionCreator::request_raw_connection, dc_id_, false, false,
                  std::move(wrapped_promise), 1L, std::move(auth_data));
   }
+
   void on_tmp_auth_key_updated(td::mtproto::AuthKey auth_key) final {
     // nop
   }
+
   void on_server_salt_updated(std::vector<td::mtproto::ServerSalt> server_salts) final {
     auth_data_->set_future_salts(std::move(server_salts));
   }
+
   void on_update(td::BufferSlice &&update, td::uint64 auth_key_id) final {
     // nop
   }
+
   void on_result(td::NetQueryPtr net_query) final {
     auto callback = net_query->move_callback();
 
@@ -201,7 +209,7 @@ class TdCoreSessionCallback final : public td::Session::Callback {
 
  private:
   td::DcId dc_id_;
-  td::ActorShared<> parent_;
+  td::ActorShared<TdCoreClient> parent_;
   std::shared_ptr<td::AuthDataShared> auth_data_;
 };
 
@@ -233,9 +241,17 @@ class TdCoreNetQueryCallback final : public td::NetQueryCallback {
   td::ActorShared<> parent_;
 };
 
-td::ActorShared<> TdCoreClient::create_reference(td::uint64 id) {
+td::ActorShared<TdCoreClient> TdCoreClient::create_reference(td::uint64 id) {
   shared_ref_cnt_++;
   return actor_shared(this, id);
+}
+
+void TdCoreClient::disconnect() {
+  td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::None);
+}
+
+void TdCoreClient::reconnect() {
+  td::send_closure(state_manager_, &td::StateManager::on_network, td::NetType::Other);
 }
 
 TdCoreClient::TdCoreClient(td::TdParameters parameters, td::DcId dc_id, td::unique_ptr<td::TdDb> td_db)
