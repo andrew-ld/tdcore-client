@@ -162,7 +162,7 @@ class TdCoreSessionCallback final : public td::Session::Callback {
   }
 
   void on_failed() final {
-    td::send_closure(parent_.get(), &TdCoreClient::destroy);
+    td::send_closure(parent_, &TdCoreClient::destroy);
   }
 
   void on_closed() final {
@@ -351,7 +351,7 @@ void TdCoreClient::perform_network_query(td::tl_object_ptr<td::telegram_api::Fun
   }
 
   auto query = td::G()->net_query_creator().create(td::UniqueId::next(), std::move(*function.release()), {}, dc_id_,
-                                                   td::NetQuery::Type::Common, td::NetQuery::AuthFlag::On);
+                                                   td::NetQuery::Type::Common, td::NetQuery::AuthFlag::Off);
 
   query->set_callback(td::create_actor<TdCoreNetQueryCallback>(
       PSTRING() << "NetworkQueryCallback:" << identifier_ << ":" << query->id(), create_reference(6),
